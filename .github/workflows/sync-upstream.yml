@@ -1,0 +1,74 @@
+name: Sync Upstream
+
+# 每天定时把上游默认分支合并进来；冲突时不推送，改为开 issue 列出待人工处理的文件。
+# 本仓库是纯镜像 fork：分支里只多出这一个工作流文件，其余内容始终跟随上游。
+on:
+  schedule:
+    - cron: '0 19 * * *' # 03:00 Asia/Shanghai
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: jxxghp/MoviePilot-Wiki
+      UPSTREAM_BRANCH: main
+      TARGET_BRANCH: main
+      ISSUE_TITLE: 上游同步失败
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          behind=$(git rev-list --count "HEAD..upstream/${UPSTREAM_BRANCH}")
+          echo "behind=$behind" >> "$GITHUB_OUTPUT"
+          if [ "$behind" -eq 0 ]; then
+            echo "上游无新提交，跳过"
+          else
+            echo "上游领先 ${behind} 个提交"
+          fi
+
+      - name: Merge upstream
+        if: steps.fetch.outputs.behind != '0'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit "upstream/${UPSTREAM_BRANCH}"
+
+      - name: Push merge
+        if: steps.fetch.outputs.behind != '0'
+        run: git push origin "HEAD:${TARGET_BRANCH}"
+
+      - name: Report sync failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          body=$(printf '自动同步上游 `%s` 失败，未推送任何改动。\n\n- 仓库：`%s`\n- 运行记录：%s\n\n请查看运行日志或手动解决冲突后重新运行。\n' \
+            "$UPSTREAM_REPO" "$GITHUB_REPOSITORY" "$RUN_URL")
+          existing=$(gh api "repos/${GITHUB_REPOSITORY}/issues?state=open&per_page=100" \
+            --jq "[.[] | select(.title == \"${ISSUE_TITLE}\") | .number][0] // empty")
+          if [ -n "$existing" ]; then
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues/${existing}/comments" -f body="$body" > /dev/null
+          else
+            gh api -X POST "repos/${GITHUB_REPOSITORY}/issues" -f title="$ISSUE_TITLE" -f body="$body" > /dev/null
+          fi
